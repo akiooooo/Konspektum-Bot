@@ -21,6 +21,8 @@
 
 Нужны **Python 3.12+**, доступ к Telegram и интернет для первоначальной установки. Поддерживаются Windows, Linux и macOS с подходящим Python. Для установки из любой папки:
 
+На Windows используйте обычный **CPython с python.org** (рекомендуется 3.13). Python из MSYS2/MinGW/Cygwin для автоматического запуска не поддерживается. При запуске из PyCharm уже активное окружение проекта используется повторно; скрипт не пересоздаёт его поверх работающего интерпретатора.
+
 ```sh
 git clone https://github.com/akiooooo/Konspektum-Bot.git
 cd Konspektum-Bot
@@ -28,6 +30,8 @@ python run.py
 ```
 
 Скрипт создаст `.venv`, установит зафиксированные зависимости и, если настройки отсутствуют, создаст `.env`. Заполните файл и повторите `python run.py`. На Linux/macOS команда может называться `python3`.
+
+Если PyCharm запускает `.venv/bin/python.exe` с базовым Python из `C:\msys64\...`, остановите запуск, закройте PyCharm и переименуйте `.venv` в `.venv-old`. Установите Python 3.13 для Windows с [официального сайта](https://www.python.org/downloads/windows/). В папке проекта выполните `py -3.13 run.py`. Затем в PyCharm → Python Interpreter выберите созданный `.venv\Scripts\python.exe`. Не переносите старое окружение в новое; `.env` и каталог данных оставьте на месте. Для Windows стандартная структура — `Scripts`, для Linux/macOS — `bin`.
 
 Обязательные настройки:
 
