@@ -12,6 +12,7 @@ from .store import Store
 from .web import create_app
 from .delivery import status_worker
 from .security import SecretFormatter
+from .polling import ConflictGuard
 
 
 async def main(demo=False,web_only=False,port=None,host=None):
@@ -48,7 +49,13 @@ async def main(demo=False,web_only=False,port=None,host=None):
                 raise ValueError('У бота установлен webhook. Удалите его перед запуском long polling; автоматическое удаление отключено, чтобы не прервать другой сервер.')
             await setup_commands(bot)
             worker=asyncio.create_task(status_worker(bot,store))
+            guard=ConflictGuard(dispatcher)
+            bot.session.middleware(guard)
             await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types(), close_bot_session=False)
+            if guard.stop_task:
+                await guard.stop_task
+            if guard.conflict:
+                raise ValueError('Telegram обнаружил другую работающую копию этого бота. Эта копия остановлена, чтобы вход и заказы не попадали в разные базы. Оставьте один запуск бота вместе с его сайтом.')
     finally:
         if worker:
             worker.cancel()

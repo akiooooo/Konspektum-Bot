@@ -132,9 +132,10 @@ class BrowserAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('HttpOnly',response.headers['Set-Cookie'])
         self.assertIn('SameSite=Strict',response.headers['Set-Cookie'])
         token=data['login_url'].split('login_')[1]
-        self.assertFalse((await (await self.client.get('/api/auth/poll')).json())['authenticated'])
+        self.assertFalse((await (await self.client.get(data['poll_url'])).json())['authenticated'])
         await self.store.login_approve(token,{'id':100,'first_name':'Админ'})
-        self.assertTrue((await (await self.client.get('/api/auth/poll')).json())['authenticated'])
+        self.assertTrue((await (await self.client.get(data['poll_url'])).json())['authenticated'])
+        self.assertTrue((await (await self.client.get(data['poll_url'])).json())['authenticated'])
         bootstrap=await (await self.client.get('/api/bootstrap')).json()
         self.assertTrue(bootstrap['is_admin'])
         self.assertEqual((await self.client.get('/api/admin/data')).status,200)
@@ -144,6 +145,26 @@ class BrowserAuthTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.store.settings())['welcome'],'Новое приветствие')
         await self.client.post('/api/auth/logout',headers=headers,json={})
         self.assertEqual((await self.client.get('/api/admin/data')).status,401)
+
+    async def test_login_tabs_have_separate_challenges(self):
+        first=await (await self.client.post('/api/auth/start',json={})).json()
+        second=await (await self.client.post('/api/auth/start',json={})).json()
+        token=first['login_url'].split('login_')[1]
+        await self.store.login_approve(token,{'id':100,'first_name':'Админ'})
+        self.assertFalse((await (await self.client.get(second['poll_url'])).json())['authenticated'])
+        self.assertTrue((await (await self.client.get(first['poll_url'])).json())['authenticated'])
+        bootstrap=await (await self.client.get('/api/bootstrap')).json()
+        self.assertEqual(bootstrap['user']['id'],100)
+
+    async def test_login_survives_store_recreation_and_rejects_wrong_browser(self):
+        data=await (await self.client.post('/api/auth/start',json={})).json()
+        token=data['login_url'].split('login_')[1]
+        restarted=Store(self.cfg)
+        self.assertEqual(await restarted.login_challenge(token),data['code'])
+        await restarted.login_approve(token,{'id':100})
+        async with TestClient(TestServer(create_app(self.cfg,restarted)),cookie_jar=CookieJar(unsafe=True)) as stranger:
+            self.assertEqual((await stranger.get(data['poll_url'])).status,400)
+        self.assertTrue((await (await self.client.get(data['poll_url'])).json())['authenticated'])
 
     async def test_cross_origin_mutations_and_guest_draft(self):
         payload={'cart':[{'id':1,'quantity':2,'price':4500}],'deadline':'Нужно срочно','note':'Химия'}

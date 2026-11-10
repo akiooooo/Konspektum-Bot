@@ -7,16 +7,23 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from .store import STATUSES
 
 
-async def send_reply(bot, store, order_id, actor_id, body, request_key):
+async def send_reply(bot, store, order_id, actor_id, body, request_key, attachment=None, upload=None):
     if bot is None:
         raise ValueError('Telegram временно недоступен. Сообщение не отправлено.')
-    message, order, fresh = await store.prepare_reply(order_id, actor_id, body, request_key)
+    message, order, fresh = await store.prepare_reply(order_id, actor_id, body, request_key,attachment)
     if not fresh:
         return message
     markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Ответить по заказу',callback_data=f'chat:{order_id}')]])
     try:
-        sent=await asyncio.wait_for(bot.send_message(order['user_id'],
-            f'<b>Конспектум · {html.escape(order["code"])}</b>\n\n{html.escape(message["body"])}',reply_markup=markup),timeout=12)
+        text=f'<b>Конспектум · {html.escape(order["code"])}</b>\n\n{html.escape(message["body"])}'
+        if attachment:
+            method=bot.send_photo if attachment['kind']=='photo' else bot.send_document
+            field='photo' if attachment['kind']=='photo' else 'document'
+            sent=await asyncio.wait_for(method(order['user_id'],**{field:upload or attachment['file_id']},caption=text,reply_markup=markup),timeout=30)
+            media=sent.photo[-1] if sent.photo else sent.document
+            attachment=attachment | {'file_id':media.file_id}
+        else:
+            sent=await asyncio.wait_for(bot.send_message(order['user_id'],text,reply_markup=markup),timeout=12)
     except (TelegramForbiddenError,TelegramBadRequest):
         await store.finish_reply(message['id'],'failed')
         return message | {'state':'failed'}
@@ -27,7 +34,7 @@ async def send_reply(bot, store, order_id, actor_id, body, request_key):
     except BaseException:
         await store.finish_reply(message['id'],'unknown')
         raise
-    await store.finish_reply(message['id'],'sent',sent.message_id)
+    await store.finish_reply(message['id'],'sent',sent.message_id,attachment)
     return message | {'state':'sent','telegram_message_id':sent.message_id}
 
 
@@ -37,10 +44,10 @@ async def send_status(bot,store,event_id):
     event=await store.claim_status(event_id)
     if event is None:
         return False
-    explanations={'new':'Заказ принят. Согласуем детали в личных сообщениях.',
+    explanations={'new':'Заказ принят. Материалы и детали можно отправить в чате этого заказа.',
         'discussing':'Уточняем материалы, сроки и стоимость.',
         'in_progress':'Мы приступили к вашему конспекту.',
-        'done':'Ваш заказ готов. Детали получения обсудим в личных сообщениях.',
+        'done':'Ваш заказ готов. Детали получения обсудим в чате заказа.',
         'cancelled':'Заказ отменён. Если остались вопросы, напишите нам.'}
     markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='Открыть заказ',callback_data=f'order:{event["order_id"]}')]])
     try:

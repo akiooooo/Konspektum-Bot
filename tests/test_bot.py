@@ -4,7 +4,7 @@ from datetime import datetime, timezone
 from unittest.mock import AsyncMock, patch
 
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage
+from aiogram.methods import AnswerCallbackQuery, EditMessageText, SendMessage, SendPhoto, SendDocument
 from aiogram.types import Chat, Message, Update, User, InlineKeyboardMarkup
 
 from konspektum.bot import make_bot
@@ -24,6 +24,8 @@ class FakeSession(BaseSession):
         self.calls.append(method)
         if isinstance(method, AnswerCallbackQuery):
             return True
+        if isinstance(method,(SendPhoto,SendDocument)):
+            return Message.model_validate({'message_id':20,'date':int(datetime.now().timestamp()),'chat':{'id':int(method.chat_id),'type':'private'},'photo':[{'file_id':'reply_photo','file_unique_id':'unique_reply','width':100,'height':100,'file_size':100}]})
         if isinstance(method, (SendMessage, EditMessageText)):
             return Message(message_id=10, date=datetime.now(timezone.utc), chat=Chat(id=int(method.chat_id), type='private'),
                            from_user=User(id=bot.id, is_bot=True, first_name='Конспектум'), text=method.text,
@@ -52,10 +54,15 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.bot.session.close()
         self.temp.cleanup()
 
-    async def send(self, text=None, callback=None, uid=200,reply_to_id=None):
+    async def send(self, text=None, callback=None, uid=200,reply_to_id=None,photo=False):
         self.counter += 1
         user = {'id':uid, 'is_bot':False, 'first_name':'Аня', 'username':'anya_test'}
-        message = {'message_id':10, 'date':int(datetime.now().timestamp()), 'chat':{'id':uid,'type':'private'}, 'from':user, 'text':text or 'Меню'}
+        message = {'message_id':self.counter, 'date':int(datetime.now().timestamp()), 'chat':{'id':uid,'type':'private'}, 'from':user, 'text':text or 'Меню'}
+        if photo:
+            message.pop('text')
+            message['photo']=[{'file_id':'incoming_photo','file_unique_id':'unique_photo','width':100,'height':100,'file_size':100}]
+            if text:
+                message['caption']=text
         if reply_to_id:
             message['reply_to_message']={'message_id':reply_to_id,'date':message['date'],'chat':message['chat'],'from':{'id':123456789,'is_bot':True,'first_name':'Конспектум'},'text':'Сообщение магазина'}
         update = {'update_id':self.counter}
@@ -64,7 +71,8 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         else:
             update['message'] = message
         await self.dp.feed_update(self.bot, Update.model_validate(update))
-        return [c for c in self.session.calls if isinstance(c,(SendMessage,EditMessageText))][-1]
+        replies=[c for c in self.session.calls if isinstance(c,(SendMessage,EditMessageText))]
+        return replies[-1] if replies else None
 
     async def test_native_checkout_and_duplicate_click(self):
         await self.send('/start')
@@ -77,7 +85,7 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         with patch('konspektum.bot.notify_order', new=AsyncMock(return_value=True)) as notify:
             result = await self.send(callback=place)
             self.assertIn('225 ₽', result.text)
-            self.assertIn('https://t.me/test_shop', result.reply_markup.inline_keyboard[0][0].url)
+            self.assertEqual(result.reply_markup.inline_keyboard[0][0].callback_data,f'chat:{(await self.store.orders())[0]["id"]}')
             await self.send(callback=place)
             self.assertEqual(notify.await_count, 1)
         self.assertEqual(len(await self.store.orders(200)), 1)
@@ -138,8 +146,41 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(code,result.text)
         self.assertIsNone(await self.store.login_finish(browser))
         await self.send(callback='login:'+token)
+
         session=await self.store.login_finish(browser)
+        result=await self.send('/start login_'+token)
+        self.assertIn('Вход уже подтверждён',result.text)
+        self.assertNotIn('истекла',result.text)
+        # A second click must not fail after the website has consumed the login.
+        await self.send(callback='login:'+token)
         self.assertEqual((await self.store.session(session))['user']['id'],200)
+
+    async def test_chat_accepts_photos_in_both_directions_and_stays_open(self):
+        order,_=await self.store.create_order({'id':200},[{'id':1,'quantity':1,'price':4500}],'Не спешу','','photo_chat_order')
+        await self.send(callback=f'chat:{order["id"]}')
+        await self.send('Материалы',photo=True)
+        # No extra callback is needed for the next message.
+        self.counter+=1
+        await self.send('Ещё вопрос')
+        messages=await self.store.messages(order['id'])
+        self.assertEqual(len(messages),2)
+        self.assertEqual(messages[0]['attachment']['file_id'],'incoming_photo')
+        await self.send(callback=f'areply:{order["id"]}',uid=100)
+        await self.send('Готовая страница',uid=100,photo=True)
+        messages=await self.store.messages(order['id'])
+        self.assertEqual(messages[-1]['attachment']['file_id'],'reply_photo')
+        self.assertEqual(messages[-1]['state'],'sent')
+
+    async def test_delete_order_needs_admin_and_confirmation(self):
+        order,_=await self.store.create_order({'id':200},[{'id':1,'quantity':1,'price':4500}],'Не спешу','','delete_order_123')
+        await self.send(callback=f'delorder:{order["id"]}',uid=200)
+        self.assertEqual((await self.store.order(order['id']))['id'],order['id'])
+        result=await self.send(callback=f'delorder:{order["id"]}',uid=100)
+        confirm=result.reply_markup.inline_keyboard[0][0].callback_data
+        self.assertIn('Удалить заказ',result.text)
+        self.assertEqual(len(await self.store.orders()),1)
+        await self.send(callback=confirm,uid=100)
+        self.assertEqual(await self.store.orders(),[])
 
     async def test_admin_status_sends_notice_to_customer(self):
         order,_=await self.store.create_order({'id':200},[{'id':1,'quantity':1,'price':4500}],'Не спешу','','status_test_123')

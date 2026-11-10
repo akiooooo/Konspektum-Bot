@@ -16,24 +16,25 @@ from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, Inlin
 from .config import Config
 from .security import RateLimiter
 from .delivery import send_reply,send_status
-from .store import DEADLINES, STATUSES, Conflict, Store, contact_url, money, order_text, price,clean_text
+from .store import DEADLINES, STATUSES, Conflict, Store, money, order_text, price,clean_text
 
 log = logging.getLogger(__name__)
 esc = html.escape
 
 
-def keyboard(rows):
-    def style(target,label):
-        action=target.split(':',1)[0]
-        if action in {'clear','del'}:
-            return 'danger'
-        if action in {'place','login'} or 'оплатить' in label.lower():
-            return 'success'
-        if action in {'checkout','catalog'} and not label.startswith('←'):
-            return 'primary'
+def attachment_of(message):
+    media=message.photo[-1] if message.photo else message.document
+    if media is None:
         return None
+    if media.file_size and media.file_size>20*1024*1024:
+        raise ValueError('Максимальный размер вложения — 20 МБ.')
+    return {'kind':'photo' if message.photo else 'document','file_id':media.file_id,
+            'name':'Фото.jpg' if message.photo else (media.file_name or 'Документ'), 'size':media.file_size or 0}
+
+
+def keyboard(rows):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=label, style=style(target,label), **({'url': target} if target.startswith(('https://', 'tg://')) else {'callback_data': target}))
+        InlineKeyboardButton(text=label, **({'url': target} if target.startswith(('https://', 'tg://')) else {'callback_data': target}))
         for label, target in row] for row in rows])
 
 
@@ -108,7 +109,7 @@ def make_bot(config: Config, store: Store):
     async def home(event):
         settings = await store.settings()
         rows = [[('✎ Каталог услуг', 'catalog:0')], [('🛍 Корзина', 'cart'), ('◷ Мои заказы', 'orders')],
-                [('? Помощь', 'about'), ('Связаться с нами ↗', contact_url(settings['shop_username']))]]
+                [('? Помощь', 'about'), ('✉ Чаты заказов', 'orders')]]
         markup = keyboard(rows)
         if config.webapp_url:
             markup.inline_keyboard.append([InlineKeyboardButton(text='Открыть витрину ↗', web_app=WebAppInfo(url=config.webapp_url))])
@@ -118,7 +119,7 @@ def make_bot(config: Config, store: Store):
                    + esc(settings['welcome'])+'\n\n'
                    + 'Конспекты на машинке по вашим материалам. Аккуратно, с вниманием к каждой странице.\n\n'
                    + '<blockquote>Услуги и объём → удобный срок → готовый заказ</blockquote>\n\n'
-                   + 'Выберите услуги — стоимость рассчитаем сразу. Материалы, итоговую цену и оплату обсудим лично.', markup=markup)
+                   + 'Выберите услуги — стоимость рассчитаем сразу. Материалы, итоговую цену и оплату обсудим в чате заказа в этом боте.', markup=markup)
 
     @router.message(CommandStart())
     @router.message(Command('menu', 'cancel'))
@@ -132,24 +133,34 @@ def make_bot(config: Config, store: Store):
         try:
             if payload.startswith('order_'):
                 order,created=await store.redeem_draft(payload[6:],message.from_user.model_dump())
-                await message.answer('✓ <b>Заказ с сайта создан</b>\nУслуги, количество и пожелания сохранены. Осталось согласовать материалы и оплату.')
+                await message.answer('✓ <b>Заказ с сайта создан</b>\nУслуги, количество и пожелания сохранены. Пришлите материалы и вопросы в чат этого заказа.')
                 await order_view(message,order)
+                await state.update_data(thread_order=order['id'])
+                await state.set_state(Form.customer_message)
                 if created:
                     await notify_order(bot,store,config,order)
                 return
             if payload.startswith('login_'):
                 token=payload[6:]
-                code=await store.login_challenge(token)
+                info=await store.login_info(token)
+                if info['approved']:
+                    await show(message,'✓ <b>Вход уже подтверждён</b>\n\nВернитесь на страницу сайта, где вы начали вход. Если вы вышли из аккаунта, начните новый вход на сайте.',[[('В магазин','home')]])
+                    return
+                code=info['code']
                 await show(message,f'<b>Вход в Конспектум</b>\n\nСайт: {esc(config.webapp_url or "локальный сайт магазина")}\nКод на сайте: <code>{code}</code>\n\n'
                     'Сравните его с кодом в открытом вами браузере. Подтвердите вход только если вы сами начали его на сайте магазина. '
                     'Не подтверждайте ссылки, присланные другими людьми.\n\nСсылка действует 5 минут.',
                     [[('Подтвердить вход',f'login:{token}')],[('Отмена','home')]])
                 return
-            if payload.startswith('view_'):
+            if payload.startswith(('view_','chat_')):
                 order=await store.order(int(payload[5:]))
                 if order['user_id']!=message.from_user.id:
                     raise ValueError('Заказ не найден.')
                 await order_view(message,order)
+                if payload.startswith('chat_'):
+                    await state.update_data(thread_order=order['id'])
+                    await state.set_state(Form.customer_message)
+                    await message.answer('Отправьте сообщение, фото или документ для этого заказа. Ответ магазина придёт сюда.')
                 return
         except ValueError as exc:
             await message.answer(esc(str(exc)))
@@ -210,7 +221,7 @@ def make_bot(config: Config, store: Store):
         if len(clean) > 20:
             lines.append(f'И ещё {len(clean) - 20} позиций. Полный состав сохранится в заказе.')
         rows = [[('Продолжить →', 'checkout')], [('＋ Добавить услуги', 'catalog:0')]] + rows + [[('Очистить', 'clear'), ('← Меню', 'home')]]
-        await show(event, '<b>Ваш заказ</b>\n\n' + esc('\n'.join(lines)[:2900]) + f'\n\nПредварительно: <b>{money(total)}</b>\nОплата после согласования в ЛС.', rows)
+        await show(event, '<b>Ваш заказ</b>\n\n' + esc('\n'.join(lines)[:2900]) + f'\n\nПредварительно: <b>{money(total)}</b>\nОплата после согласования в чате заказа.', rows)
 
     async def order_view(event, order, admin=False):
         settings = await store.settings()
@@ -218,9 +229,10 @@ def make_bot(config: Config, store: Store):
         if admin:
             rows += [[('✉ Ответить клиенту', f'areply:{order["id"]}')]]
             rows += [[(label, f'status:{order["id"]}:{key}')] for key, label in STATUSES.items()]
+            rows += [[('Удалить заказ…', f'delorder:{order["id"]}')]]
             rows += [[('← Все заказы', 'aorders')]]
         else:
-            rows += [[('Обсудить и оплатить ↗', contact_url(settings['shop_username'], order))], [('✉ Написать по заказу',f'chat:{order["id"]}')], [('← Мои заказы', 'orders')], [('← Главное меню', 'home')]]
+            rows += [[('✉ Обсудить заказ в боте',f'chat:{order["id"]}')], [('← Мои заказы', 'orders')], [('← Главное меню', 'home')]]
         text = f'<b>{esc(order["code"])} · {STATUSES[order["status"]]}</b>\n\n' + esc(order_text(order)[:3300])
         if admin:
             text += f'\n\nКлиент: <a href="tg://user?id={order["user_id"]}">{esc(order["name"])}</a> · <code>{order["user_id"]}</code>'
@@ -230,7 +242,7 @@ def make_bot(config: Config, store: Store):
 
     async def callbacks(event: CallbackQuery, state: FSMContext):
         action, *parts = (event.data or '').split(':')
-        admin_actions = {'admin', 'as', 'ae', 'aa', 'af', 'toggle', 'aorders', 'ao', 'settings', 'setting', 'status','areply','anunit','ancustom','andesc','ancreate'}
+        admin_actions = {'admin', 'as', 'ae', 'aa', 'af', 'toggle', 'aorders', 'ao', 'settings', 'setting', 'status','delorder','confirmdelete','areply','anunit','ancustom','andesc','ancreate'}
         if action in admin_actions and event.from_user.id not in config.admins:
             await event.answer('Нет доступа.', show_alert=True)
             return
@@ -242,6 +254,19 @@ def make_bot(config: Config, store: Store):
         elif action=='login':
             await store.login_approve(parts[0],event.from_user.model_dump())
             await show(event,'✓ <b>Вход подтверждён</b>\n\nВернитесь в тот браузер, где вы начали вход. Страница обновится автоматически.',[[('В магазин','home')]])
+        elif action=='delorder':
+            order=await store.order(int(parts[0]))
+            nonce=secrets.token_urlsafe(12)
+            await state.update_data(delete_order=order['id'],delete_code=order['code'],delete_nonce=nonce)
+            await show(event,f'<b>Удалить заказ {esc(order["code"])}?</b>\n\nЗаказ и сохранённая переписка будут удалены. Отправленные сообщения в Telegram останутся. Отменить удаление нельзя.',
+                [[('Да, удалить',f'confirmdelete:{order["id"]}:{nonce}')],[('Отмена',f'ao:{order["id"]}')]])
+        elif action=='confirmdelete':
+            data=await state.get_data()
+            if len(parts)!=2 or data.get('delete_order')!=int(parts[0]) or not secrets.compare_digest(data.get('delete_nonce',''),parts[1]):
+                raise ValueError('Откройте подтверждение удаления заново.')
+            await store.delete_order(int(parts[0]),data['delete_code'])
+            await state.update_data(delete_nonce='')
+            await show(event,'✓ Заказ и его переписка удалены.',[[('К заказам','aorders')]])
         elif action in {'chat','areply'}:
             order=await store.order(int(parts[0]))
             if action=='chat' and order['user_id']!=event.from_user.id:
@@ -250,7 +275,7 @@ def make_bot(config: Config, store: Store):
             await state.set_state(Form.admin_reply if action=='areply' else Form.customer_message)
             messages=await store.messages(order['id'])
             excerpt='\n\n'.join(('Магазин' if m['direction']=='out' else 'Покупатель')+': '+m['body'][:300] for m in messages[-4:])
-            await show(event,f'<b>Переписка · {esc(order["code"])}</b>\n\n'+(esc(excerpt)+'\n\n' if excerpt else '')+'Отправьте текст сообщения (до 2000 символов).\nФайлы и материалы отправляйте магазину в ЛС.\n\n/cancel — отменить.',[[('← К заказу',f'{"ao" if action=="areply" else "order"}:{order["id"]}')]])
+            await show(event,f'<b>Переписка · {esc(order["code"])}</b>\n\n'+(esc(excerpt)+'\n\n' if excerpt else '')+'Отправьте текст сообщения (до 2000 символов).\nЗдесь можно отправить текст, фото или документ (до 20 МБ).\n\n/cancel — отменить.',[[('← К заказу',f'{"ao" if action=="areply" else "order"}:{order["id"]}')]])
         elif action in {'catalog', 'as'}:
             await catalog(event, int(parts[0]), action == 'as')
         elif action in {'svc', 'ae'}:
@@ -306,14 +331,14 @@ def make_bot(config: Config, store: Store):
                 await cart_view(event, state)
                 return
             await state.update_data(request_key=secrets.token_urlsafe(18), ready_key=None)
-            await show(event, '<b>КОНСПЕКТУМ / ОФОРМЛЕНИЕ</b>\n\n<b>02 · Когда нужен конспект?</b>\n\n<blockquote>Выберите желаемый срок. Возможность срочного выполнения и итоговую дату подтвердим в ЛС.</blockquote>', [[(d, f'deadline:{i}')] for i, d in enumerate(DEADLINES)] + [[('← К заказу', 'cart')]])
+            await show(event, '<b>КОНСПЕКТУМ / ОФОРМЛЕНИЕ</b>\n\n<b>02 · Когда нужен конспект?</b>\n\n<blockquote>Выберите желаемый срок. Возможность срочного выполнения и итоговую дату подтвердим в чате заказа.</blockquote>', [[(d, f'deadline:{i}')] for i, d in enumerate(DEADLINES)] + [[('← К заказу', 'cart')]])
         elif action == 'deadline':
             index = int(parts[0])
             if not 0 <= index < len(DEADLINES):
                 raise ValueError('Выберите срок заново.')
             await state.update_data(deadline=DEADLINES[index])
             await state.set_state(Form.note)
-            await show(event, '<b>КОНСПЕКТУМ / ОФОРМЛЕНИЕ</b>\n\n<b>03 · Добавим детали?</b>\nНапишите предмет, формат тетради и пожелания (до 1000 символов).\n\n<blockquote>Материалы отправите в ЛС после оформления. Платёжные данные в боте не нужны.</blockquote>', [[('Без комментария →', 'skip')], [('← К заказу', 'cart')]])
+            await show(event, '<b>КОНСПЕКТУМ / ОФОРМЛЕНИЕ</b>\n\n<b>03 · Добавим детали?</b>\nНапишите предмет, формат тетради и пожелания (до 1000 символов).\n\n<blockquote>Материалы отправите сюда, в чат заказа после оформления. Платёжные данные в боте не нужны.</blockquote>', [[('Без комментария →', 'skip')], [('← К заказу', 'cart')]])
         elif action == 'skip':
             if await state.get_state() != Form.note.state:
                 raise ValueError('Откройте оформление заказа заново.')
@@ -332,6 +357,8 @@ def make_bot(config: Config, store: Store):
                 return
             await state.update_data(cart={})
             await order_view(event, order)
+            await state.update_data(thread_order=order['id'])
+            await state.set_state(Form.customer_message)
             if created:
                 await notify_order(bot, store, config, order)
         elif action in {'orders', 'aorders'}:
@@ -346,7 +373,7 @@ def make_bot(config: Config, store: Store):
             await order_view(event, order, action == 'ao')
         elif action == 'about':
             settings = await store.settings()
-            await show(event, '<b>Освободите время для важного</b>\n\n1. Выберите услуги и объём.\n2. Оставьте пожелания по срокам.\n3. Перейдите в ЛС, пришлите материалы и согласуйте оплату.\n\n' + esc(settings['about']) + '\n\nХраним ваш Telegram ID, имя и сведения о заказе для его выполнения. Не присылайте в бота реквизиты карт и пароли.', [[('✎ Выбрать услуги', 'catalog:0')], [('← Меню', 'home')]])
+            await show(event, '<b>Освободите время для важного</b>\n\n1. Выберите услуги и объём.\n2. Оставьте пожелания по срокам.\n3. Откройте чат заказа в боте, пришлите материалы и согласуйте оплату.\n\n' + esc(settings['about']) + '\n\nХраним ваш Telegram ID, имя и сведения о заказе для его выполнения. Не присылайте в бота реквизиты карт и пароли.', [[('✎ Выбрать услуги', 'catalog:0')], [('← Меню', 'home')]])
         elif action == 'admin':
             await admin_home(event)
         elif action == 'aa':
@@ -398,7 +425,7 @@ def make_bot(config: Config, store: Store):
             await catalog(event, admin=True)
         elif action == 'settings':
             s = await store.settings()
-            await show(event, f'<b>Настройки магазина</b>\n\nКонтакт для оплаты: @{esc(s["shop_username"])}\nУведомления: {esc(s["notify_chat_id"]) or "администраторам"}\nПриветствие: {esc(s["welcome"])}', [
+            await show(event, f'<b>Настройки магазина</b>\n\nКонтакт владельца: @{esc(s["shop_username"])}\nУведомления: {esc(s["notify_chat_id"]) or "администраторам"}\nПриветствие: {esc(s["welcome"])}', [
                 [('Контакт магазина', 'setting:shop_username')], [('Чат уведомлений', 'setting:notify_chat_id')],
                 [('Приветствие', 'setting:welcome'), ('О магазине', 'setting:about')], [('← Управление', 'admin')]])
         elif action == 'setting':
@@ -423,7 +450,7 @@ def make_bot(config: Config, store: Store):
         text += f'\n\nПредварительно: <b>{money(total)}</b>\nСрок: {esc(data["deadline"])}'
         if data.get('note'):
             text += '\n' + esc(data['note'])
-        text += '\n\nСоздавая заказ, вы передаёте магазину своё имя, Telegram ID и данные заказа для его выполнения. Оплата и окончательные условия — в ЛС.'
+        text += '\n\nСоздавая заказ, вы передаёте магазину своё имя, Telegram ID и данные заказа для его выполнения. Оплата и окончательные условия — в чате заказа в боте.'
         await state.update_data(ready_key=data['request_key'])
         await show(event, text, [[('Создать заказ →', f'place:{data["request_key"]}')], [('← Изменить заказ', 'cart')]])
 
@@ -440,7 +467,7 @@ def make_bot(config: Config, store: Store):
             await show(message,'<b>КОНСПЕКТУМ / МОИ ЗАКАЗЫ</b>\n\n'+('Выберите заказ, чтобы увидеть детали или написать нам.' if orders else 'Здесь появятся ваши заказы.'),rows+[[('← В магазин','home')]])
         else:
             s=await store.settings()
-            await show(message,'<b>КОНСПЕКТУМ / ПОМОЩЬ</b>\n\n<b>Как заказать?</b>\nВыберите услуги и количество → срок → пожелания. После оформления пришлите материалы магазину в ЛС.\n\n<b>Как оплатить?</b>\nСогласуем стоимость и способ оплаты лично. В боте нет платёжных форм.\n\n<b>Как считать страницы?</b>\nУкажите примерный объём. Формат тетради, плотность записи и окончательный объём обсудим по материалам.\n\n<b>Как связаться?</b>\nНапрямую в ЛС или кнопкой «Написать по заказу».',[[('Связаться с нами ↗',contact_url(s['shop_username']))],[('Выбрать услуги','catalog:0')]])
+            await show(message,'<b>КОНСПЕКТУМ / ПОМОЩЬ</b>\n\n<b>Как заказать?</b>\nВыберите услуги и количество → срок → пожелания. После оформления пришлите материалы в чат заказа в боте.\n\n<b>Как оплатить?</b>\nСогласуем стоимость и способ оплаты лично. В боте нет платёжных форм.\n\n<b>Как считать страницы?</b>\nУкажите примерный объём. Формат тетради, плотность записи и окончательный объём обсудим по материалам.\n\n<b>Как связаться?</b>\nКнопкой «Обсудить заказ в боте».',[[('Чаты заказов','orders')],[('Выбрать услуги','catalog:0')]])
 
     @router.callback_query()
     async def dispatch_callback(event: CallbackQuery, state: FSMContext):
@@ -537,58 +564,72 @@ def make_bot(config: Config, store: Store):
         except ValueError as exc:
             await message.answer(esc(str(exc))+'\nПопробуйте ещё раз или /cancel.')
 
-    @router.message(Form.customer_message,F.text)
+    @router.message(Form.customer_message,F.text | F.photo | F.document)
     async def customer_message(message:Message,state:FSMContext):
         data=await state.get_data()
         try:
             order_id=data['thread_order']
-            fresh=await store.incoming(order_id,message.from_user.id,message.text,f'tg_{message.chat.id}_{message.message_id}')
+            attachment=attachment_of(message)
+            body=message.text or message.caption or ''
+            fresh=await store.incoming(order_id,message.from_user.id,body,f'tg_{message.chat.id}_{message.message_id}',attachment)
             order=await store.order(order_id)
-            await state.set_state(None)
-            await message.answer('✓ Сообщение сохранено. Ответ придёт сюда, в Telegram.')
-            await order_view(message,order)
+            await state.set_state(Form.customer_message)
+            await message.answer(f'✓ Отправлено · {esc(order["code"])}. Можно отправить ещё сообщение или фото.',reply_markup=keyboard([[('К заказу',f'order:{order_id}')]]))
             if fresh:
                 settings=await store.settings()
                 destinations=[settings['notify_chat_id']] if settings['notify_chat_id'] else config.admins
                 async def notify(destination):
                     try:
-                        await asyncio.wait_for(bot.send_message(destination,f'<b>Сообщение · {esc(order["code"])}</b>\n\n{esc(message.text)}',
+                        await asyncio.wait_for(bot.send_message(destination,f'<b>Сообщение · {esc(order["code"])}</b>\n\n{esc(body) or "Вложение"}',
                             reply_markup=keyboard([[('Ответить',f'areply:{order_id}')]]) if int(destination)>0 else None),timeout=8)
+                        if attachment:
+                            method=bot.send_photo if attachment['kind']=='photo' else bot.send_document
+                            field='photo' if attachment['kind']=='photo' else 'document'
+                            await asyncio.wait_for(method(destination,**{field:attachment['file_id']},caption=f'Материалы · {esc(order["code"])}'),timeout=15)
                     except (TelegramAPIError,TimeoutError):
                         log.warning('Customer message notification unavailable for order %s',order['code'])
                 await asyncio.gather(*(notify(x) for x in destinations))
         except ValueError as exc:
             await message.answer(esc(str(exc)))
 
-    @router.message(Form.admin_reply,F.text)
+    @router.message(Form.admin_reply,F.text | F.photo | F.document)
     async def admin_reply(message:Message,state:FSMContext):
         if message.from_user.id not in config.admins:
             await state.clear()
             return
         data=await state.get_data()
         try:
-            result=await send_reply(bot,store,data['thread_order'],message.from_user.id,message.text,data['reply_key'])
-            await state.set_state(None)
+            result=await send_reply(bot,store,data['thread_order'],message.from_user.id,message.text or message.caption or '',data['reply_key'],attachment_of(message))
+            await state.update_data(reply_key=secrets.token_urlsafe(18))
             labels={'sent':'✓ Ответ доставлен в Telegram покупателя.','failed':'Сообщение не доставлено. Возможно, покупатель заблокировал бота.',
                     'unknown':'Telegram не подтвердил доставку. Сообщение могло дойти; проверьте переписку перед повторной отправкой.',
                     'sending':'Отправка уже выполняется. Проверьте переписку позже.'}
             await message.answer(labels[result['state']])
-            await order_view(message,await store.order(data['thread_order']),True)
+            await message.answer('Можно отправить следующий ответ или фото. /cancel — выйти из чата.')
         except ValueError as exc:
             await message.answer(esc(str(exc)))
 
-    @router.message(F.reply_to_message,F.text)
+    @router.message(F.reply_to_message,F.text | F.photo | F.document)
     async def direct_reply(message:Message,state:FSMContext):
         order_id=await store.reply_order(message.from_user.id,message.reply_to_message.message_id)
         if order_id is not None:
             await state.update_data(thread_order=order_id)
             await customer_message(message,state)
         else:
-            await message.answer('Откройте «Мои заказы» и нажмите «Написать по заказу», чтобы сообщение попало в нужную переписку.')
+            await message.answer('Откройте «Мои заказы» и нажмите «Обсудить заказ в боте», чтобы сообщение попало в нужную переписку.')
 
     @router.message()
-    async def fallback(message: Message):
-        await message.answer('Выберите действие в меню. Материалы и файлы отправьте магазину в ЛС после оформления заказа.\n/menu — открыть магазин\n/cancel — отменить ввод')
+    async def fallback(message: Message,state:FSMContext):
+        if message.text or message.photo or message.document:
+            orders=await store.orders(message.from_user.id,2)
+            if len(orders)==1 and message.from_user.id not in config.admins:
+                await state.update_data(thread_order=orders[0]['id'])
+                await customer_message(message,state)
+                return
+            if orders:
+                await message.answer('Выберите заказ, к которому относится сообщение, затем отправьте его ещё раз.',reply_markup=keyboard([[('Мои заказы','orders')]]))
+                return
+        await message.answer('Выберите действие в меню. Материалы и файлы отправьте в чат заказа в этом боте.\n/menu — открыть магазин\n/cancel — отменить ввод')
 
     dp.include_router(router)
     return bot, dp
@@ -596,7 +637,7 @@ def make_bot(config: Config, store: Store):
 
 async def setup_commands(bot: Bot):
     await bot.set_my_name(name='Конспектум', language_code='ru')
-    await bot.set_my_description(description='Аккуратные конспекты на машинке по вашим материалам. Выберите услуги и объём, рассчитайте стоимость и обсудите детали с нами в ЛС. Оплата после согласования.', language_code='ru')
+    await bot.set_my_description(description='Аккуратные конспекты на машинке по вашим материалам. Выберите услуги и объём, рассчитайте стоимость и обсудите детали в чате заказа в боте. Оплата после согласования.', language_code='ru')
     await bot.set_my_short_description(short_description='Конспекты на заказ. Меньше рутины — больше жизни.', language_code='ru')
     await bot.set_my_commands([BotCommand(command='start', description='Открыть Конспектум'), BotCommand(command='menu', description='Главное меню'),
                                BotCommand(command='cancel', description='Отменить ввод'), BotCommand(command='id', description='Мой Telegram ID'),

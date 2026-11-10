@@ -45,7 +45,7 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 201)
         data = await response.json()
         self.assertEqual(data['order']['total'], 9000)
-        self.assertIn('https://t.me/test_shop?text=', data['contact_url'])
+        self.assertTrue(data['contact_url'].endswith('?start=chat_'+str(data['order']['id'])))
         self.assertEqual((await self.client.post('/api/orders', json=payload, headers=self.user)).status, 200)
         other = await self.client.get('/api/orders', headers={'Authorization':'tma ' + signed(201)})
         self.assertEqual((await other.json())['orders'], [])

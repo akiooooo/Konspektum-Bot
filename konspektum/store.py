@@ -105,6 +105,7 @@ class Store:
                     expires_at INTEGER NOT NULL, approved_user TEXT, consumed INTEGER NOT NULL DEFAULT 0);
                 CREATE TABLE IF NOT EXISTS sessions (
                     token_hash TEXT PRIMARY KEY, user_json TEXT NOT NULL, csrf TEXT NOT NULL, expires_at INTEGER NOT NULL);
+                CREATE TABLE IF NOT EXISTS auth_revocations (user_id INTEGER PRIMARY KEY, revoked_at INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY, order_id INTEGER NOT NULL REFERENCES orders(id),
                     direction TEXT NOT NULL, body TEXT NOT NULL, actor_id INTEGER NOT NULL,
@@ -117,9 +118,14 @@ class Store:
                     attempts INTEGER NOT NULL DEFAULT 0, next_at INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL DEFAULT (datetime('now')));
             ''')
+            if 'attachment' not in {r['name'] for r in db.execute('PRAGMA table_info(messages)')}:
+                db.execute('ALTER TABLE messages ADD COLUMN attachment TEXT')
+            old_about='Пишем конспекты на машинке по вашим материалам. Объём, сроки и детали согласуем в личных сообщениях. Оплата — напрямую магазину после согласования.'
+            new_about='Пишем конспекты на машинке по вашим материалам. Материалы, сроки, стоимость и оплату согласуем в чате заказа в боте.'
+            db.execute("UPDATE settings SET value=? WHERE key='about' AND value=?",(new_about,old_about))
             for key, value in {'shop_username': self.config.shop_username, 'notify_chat_id': self.config.notify_chat_id,
                                'welcome': 'Ваши мысли — наш аккуратный почерк.',
-                               'about': 'Пишем конспекты на машинке по вашим материалам. Объём, сроки и детали согласуем в личных сообщениях. Оплата — напрямую магазину после согласования.'}.items():
+                               'about': new_about}.items():
                 db.execute('INSERT OR IGNORE INTO settings VALUES (?, ?)', (key, value))
             if not db.execute("SELECT 1 FROM settings WHERE key='seeded'").fetchone():
                 for item in [
@@ -272,20 +278,26 @@ class Store:
         return token, browser, code
 
     async def login_challenge(self, token):
+        info = await self.login_info(token)
+        if info['consumed']:
+            raise ValueError('Вход уже завершён. Вернитесь на сайт.')
+        return info['code']
+
+    async def login_info(self, token):
         if not re.fullmatch(r'[A-Za-z0-9_-]{32}',token):
             raise ValueError('Ссылка входа недействительна.')
         def get(db):
-            row=db.execute('SELECT code FROM login_challenges WHERE token_hash=? AND expires_at>? AND consumed=0', (self.digest(token),int(time.time()))).fetchone()
+            row=db.execute('SELECT code,consumed,approved_user IS NOT NULL AS approved FROM login_challenges WHERE token_hash=? AND expires_at>?', (self.digest(token),int(time.time()))).fetchone()
             if not row:
                 raise ValueError('Ссылка входа истекла. Начните вход на сайте заново.')
-            return row['code']
+            return dict(row)
         return await self.run(get)
 
     async def login_approve(self, token, user):
         safe_user = {key:user[key] for key in ('id','first_name','username') if key in user}
         def approve(db):
             db.execute('BEGIN IMMEDIATE')
-            row=db.execute('SELECT * FROM login_challenges WHERE token_hash=? AND expires_at>? AND consumed=0', (self.digest(token),int(time.time()))).fetchone()
+            row=db.execute('SELECT * FROM login_challenges WHERE token_hash=? AND expires_at>?', (self.digest(token),int(time.time()))).fetchone()
             if not row or (row['approved_user'] and json.loads(row['approved_user'])['id'] != user['id']):
                 raise ValueError('Ссылка входа недействительна или уже использована.')
             db.execute('UPDATE login_challenges SET approved_user=? WHERE token_hash=?', (json.dumps(safe_user,ensure_ascii=False),self.digest(token)))
@@ -319,8 +331,31 @@ class Store:
     async def logout(self, token):
         await self.run(lambda db:db.execute('DELETE FROM sessions WHERE token_hash=?',(self.digest(token),)))
 
+    async def logout_all(self, user_id):
+        def revoke(db):
+            db.execute('BEGIN IMMEDIATE')
+            db.execute("DELETE FROM sessions WHERE json_extract(user_json,'$.id')=?",(user_id,))
+            db.execute("DELETE FROM login_challenges WHERE json_extract(approved_user,'$.id')=?",(user_id,))
+            db.execute('INSERT INTO auth_revocations VALUES(?,?) ON CONFLICT(user_id) DO UPDATE SET revoked_at=excluded.revoked_at',(user_id,int(time.time())))
+        await self.run(revoke)
+
+    async def auth_revoked(self, user_id, auth_date):
+        return await self.run(lambda db:bool(db.execute('SELECT 1 FROM auth_revocations WHERE user_id=? AND revoked_at>=?',(user_id,auth_date)).fetchone()))
+
+    async def delete_order(self, order_id, confirmation):
+        def delete(db):
+            db.execute('BEGIN IMMEDIATE')
+            row=db.execute('SELECT code FROM orders WHERE id=?',(order_id,)).fetchone()
+            if not row or confirmation!=row['code']:
+                raise ValueError('Заказ не найден или подтверждение не совпадает.')
+            for table in ('drafts','messages','status_events'):
+                db.execute(f'DELETE FROM {table} WHERE order_id=?',(order_id,))
+            db.execute('DELETE FROM orders WHERE id=?',(order_id,))
+        await self.run(delete)
+
     async def messages(self, order_id):
-        return await self.run(lambda db:[dict(row) for row in db.execute('SELECT * FROM messages WHERE order_id=? ORDER BY id DESC LIMIT 100',(order_id,))][::-1])
+        rows=await self.run(lambda db:[dict(row) for row in db.execute('SELECT * FROM messages WHERE order_id=? ORDER BY id DESC LIMIT 100',(order_id,))][::-1])
+        return [r | {'attachment':json.loads(r['attachment']) if r['attachment'] else None} for r in rows]
 
     async def reply_order(self,user_id,telegram_message_id):
         def find(db):
@@ -328,18 +363,18 @@ class Store:
             return row['order_id'] if row else None
         return await self.run(find)
 
-    async def incoming(self, order_id, user_id, body, request_key):
-        body=clean_text(body,'Сообщение',2000,1)
+    async def incoming(self, order_id, user_id, body, request_key, attachment=None):
+        body=clean_text(body,'Сообщение',2000,0 if attachment else 1)
         def save(db):
             row=db.execute('SELECT user_id FROM orders WHERE id=?',(order_id,)).fetchone()
             if not row or row['user_id']!=user_id:
                 raise ValueError('Заказ не найден.')
-            cursor=db.execute("INSERT OR IGNORE INTO messages(order_id,direction,body,actor_id,state,created_at,request_key) VALUES(?,'in',?,?,'received',datetime('now'),?)",(order_id,body,user_id,request_key))
+            cursor=db.execute("INSERT OR IGNORE INTO messages(order_id,direction,body,actor_id,state,created_at,request_key,attachment) VALUES(?,'in',?,?,'received',datetime('now'),?,?)",(order_id,body,user_id,request_key,json.dumps(attachment) if attachment else None))
             return bool(cursor.rowcount)
         return await self.run(save)
 
-    async def prepare_reply(self, order_id, actor_id, body, request_key):
-        body=clean_text(body,'Сообщение',2000,1)
+    async def prepare_reply(self, order_id, actor_id, body, request_key, attachment=None):
+        body=clean_text(body,'Подпись' if attachment else 'Сообщение',900 if attachment else 2000,0 if attachment else 1)
         if not isinstance(request_key,str) or not re.fullmatch(r'[A-Za-z0-9_-]{8,80}',request_key):
             raise ValueError('Некорректный идентификатор сообщения.')
         def prepare(db):
@@ -349,15 +384,20 @@ class Store:
                 raise ValueError('Заказ не найден.')
             existing=db.execute("SELECT * FROM messages WHERE order_id=? AND direction='out' AND request_key=?",(order_id,request_key)).fetchone()
             if existing:
-                if existing['body']!=body:
+                previous=json.loads(existing['attachment']) if existing['attachment'] else None
+                if previous and attachment and 'sha256' in attachment:
+                    previous.pop('file_id',None)
+                if existing['body']!=body or previous!=attachment:
                     raise Conflict('Идентификатор сообщения уже использован. Откройте переписку заново.')
                 return dict(existing),dict(order),False
-            cursor=db.execute("INSERT INTO messages(order_id,direction,body,actor_id,state,created_at,request_key) VALUES(?,'out',?,?,'sending',datetime('now'),?)",(order_id,body,actor_id,request_key))
+            cursor=db.execute("INSERT INTO messages(order_id,direction,body,actor_id,state,created_at,request_key,attachment) VALUES(?,'out',?,?,'sending',datetime('now'),?,?)",(order_id,body,actor_id,request_key,json.dumps(attachment) if attachment else None))
             return dict(db.execute('SELECT * FROM messages WHERE id=?',(cursor.lastrowid,)).fetchone()),dict(order),True
         return await self.run(prepare)
 
-    async def finish_reply(self, message_id, state, telegram_id=None):
+    async def finish_reply(self, message_id, state, telegram_id=None, attachment=None):
         await self.run(lambda db:db.execute('UPDATE messages SET state=?,telegram_message_id=? WHERE id=?',(state,telegram_id,message_id)))
+        if attachment:
+            await self.run(lambda db:db.execute('UPDATE messages SET attachment=? WHERE id=?',(json.dumps(attachment),message_id)))
 
     @staticmethod
     def decode(row):
