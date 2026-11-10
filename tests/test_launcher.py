@@ -1,4 +1,5 @@
 import json
+import io
 import tempfile
 import unittest
 from pathlib import Path
@@ -8,6 +9,16 @@ import run
 
 
 class LauncherTests(unittest.TestCase):
+    def test_russian_installer_messages_work_with_western_windows_encoding(self):
+        buffer=io.BytesIO()
+        stream=io.TextIOWrapper(buffer,encoding='cp1252',newline='\n')
+        try:
+            with patch.object(run.sys,'stdout',stream):
+                run.console('Установка зависимостей…')
+            self.assertEqual(buffer.getvalue().decode('utf-8'),'Установка зависимостей…\n')
+        finally:
+            stream.close()
+
     def test_missing_socks_retries_once_with_scoped_direct_connection(self):
         with patch.object(run,'pip_attempt',side_effect=[(1,True),(0,False)]) as attempt:
             run.install_dependencies(Path('python.exe'),Path('requirements.lock'))

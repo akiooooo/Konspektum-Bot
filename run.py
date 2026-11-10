@@ -10,6 +10,19 @@ import sysconfig
 import venv
 
 
+def console(message, end='\n', flush=True):
+    # Redirected stdout on an English Windows machine may use cp1252.
+    try:
+        print(message,end=end,flush=flush)
+    except UnicodeEncodeError:
+        if hasattr(sys.stdout,'reconfigure'):
+            sys.stdout.reconfigure(encoding='utf-8',errors='replace')
+            print(message,end=end,flush=flush)
+        else:
+            encoding=getattr(sys.stdout,'encoding',None) or 'ascii'
+            print(message.encode(encoding,errors='backslashreplace').decode(encoding),end=end,flush=flush)
+
+
 def pip_environment(direct=False):
     environment=os.environ.copy()
     environment.update(PIP_DISABLE_PIP_VERSION_CHECK='1',PYTHONIOENCODING='utf-8')
@@ -30,7 +43,7 @@ def pip_attempt(command, environment):
             missing_socks|='missing dependencies for socks support' in line.lower()
             # Never echo proxy credentials supplied by an installer or proxy error.
             line=re.sub(r'(?i)((?:https?|socks\w*)://)[^/\s@]+@',r'\1***@',line)
-            print(line,end='',flush=True)
+            console(line,end='',flush=True)
         return process.wait(),missing_socks
 
 
@@ -39,7 +52,7 @@ def install_dependencies(python, lock, direct=False):
     try:
         code,missing_socks=pip_attempt(command,pip_environment(direct))
         if code and missing_socks and not direct:
-            print('Установщику не хватает поддержки SOCKS. Повторяем установку напрямую по HTTPS. '
+            console('Установщику не хватает поддержки SOCKS. Повторяем установку напрямую по HTTPS. '
                   'Настройки прокси компьютера и бота не меняются.',flush=True)
             code,_=pip_attempt(command,pip_environment(True))
         if code:
@@ -67,7 +80,7 @@ def environment_python(environment, windows=None):
     if environment.exists() and (not environment.is_dir() or any(environment.iterdir())):
         raise SystemExit('Папка .venv уже есть, но в ней нет подходящего Python. Не пересоздаём её поверх старой. '
                          'Остановите запуск, переименуйте .venv в .venv-old и выберите обычный Python 3.13 в PyCharm. Затем запустите run.py снова.')
-    print('Подготавливаем отдельное окружение проекта…',flush=True)
+    console('Подготавливаем отдельное окружение проекта…',flush=True)
     try:
         venv.EnvBuilder(with_pip=True).create(environment)
     except (OSError,subprocess.SubprocessError) as exc:
