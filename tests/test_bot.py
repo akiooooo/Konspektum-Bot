@@ -182,6 +182,14 @@ class BotTests(unittest.IsolatedAsyncioTestCase):
         await self.send(callback=confirm,uid=100)
         self.assertEqual(await self.store.orders(),[])
 
+    async def test_group_chatid_command_is_scoped_to_shop_admin(self):
+        def update(uid):
+            return Update.model_validate({'update_id':300+uid,'message':{'message_id':1,'date':int(datetime.now().timestamp()),'chat':{'id':-1001234567890,'type':'supergroup','title':'Закрытая группа'},'from':{'id':uid,'is_bot':False,'first_name':'Участник'},'text':'/chatid'}})
+        await self.dp.feed_update(self.bot,update(200))
+        self.assertEqual(self.session.calls,[])
+        await self.dp.feed_update(self.bot,update(100))
+        self.assertIn('-1001234567890',self.session.calls[-1].text)
+
     async def test_admin_status_sends_notice_to_customer(self):
         order,_=await self.store.create_order({'id':200},[{'id':1,'quantity':1,'price':4500}],'Не спешу','','status_test_123')
         await self.send(callback=f'status:{order["id"]}:in_progress',uid=100)

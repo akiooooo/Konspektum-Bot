@@ -74,6 +74,14 @@ class ChatSecurityTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ValueError):
             await self.store.order(self.order['id'])
 
+    async def test_notification_test_is_admin_only(self):
+        path='/api/admin/notifications/test'
+        self.assertEqual((await self.client.post(path,json={})).status,401)
+        self.assertEqual((await self.client.post(path,json={},headers={'Authorization':'tma '+signed(200)})).status,403)
+        response=await self.client.post(path,json={},headers={'Authorization':'tma '+signed(100)})
+        self.assertEqual(response.status,200)
+        self.assertTrue((await response.json())['ok'])
+
     async def test_global_logout_revokes_two_browsers_pending_logins_and_miniapp(self):
         async def login(client):
             data=await (await client.post('/api/auth/start',json={})).json()

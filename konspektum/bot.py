@@ -15,6 +15,7 @@ from aiogram.types import BotCommand, CallbackQuery, InlineKeyboardButton, Inlin
 
 from .config import Config
 from .security import RateLimiter
+from .notifications import deliver_notice
 from .delivery import send_reply,send_status
 from .store import DEADLINES, STATUSES, Conflict, Store, money, order_text, price,clean_text
 
@@ -69,21 +70,16 @@ class Throttle(BaseMiddleware):
 
 
 async def notify_order(bot: Bot, store: Store, config: Config, order: dict):
-    settings = await store.settings()
-    destinations = [settings['notify_chat_id']] if settings['notify_chat_id'] else list(config.admins)
     text = (f'🟢 <b>Новый заказ {esc(order["code"])}</b>\n'
             f'Клиент: <a href="tg://user?id={order["user_id"]}">{esc(order["name"])}</a>'
             + (f' · @{esc(order["username"])}' if order['username'] else '') + '\n\n' + esc(order_text(order)[:3200]))
-    async def send(destination):
-        try:
-            private = int(destination) > 0
-            await asyncio.wait_for(bot.send_message(destination, text, reply_markup=keyboard([[('Открыть заказ', f'ao:{order["id"]}')]]) if private else None), timeout=8)
-            return True
-        except (TelegramAPIError, TimeoutError):
-            log.warning('Order notification failed for order %s; check bot permissions and notification chat.', order['code'])
-            return False
-    results = await asyncio.gather(*(send(destination) for destination in destinations))
-    return any(results)
+    private=keyboard([[('Открыть заказ', f'ao:{order["id"]}')]])
+    name=store.config.bot_username
+    group=keyboard([[('Открыть заказ в боте',f'https://t.me/{name}?start=manage_{order["id"]}')]]) if name else None
+    result=await deliver_notice(bot,store,config,text,private,group)
+    if not result['ok']:
+        log.warning('Order notification: %s',result['message'])
+    return result['delivered']
 
 
 def make_bot(config: Config, store: Store):
@@ -151,6 +147,11 @@ def make_bot(config: Config, store: Store):
                     'Сравните его с кодом в открытом вами браузере. Подтвердите вход только если вы сами начали его на сайте магазина. '
                     'Не подтверждайте ссылки, присланные другими людьми.\n\nСсылка действует 5 минут.',
                     [[('Подтвердить вход',f'login:{token}')],[('Отмена','home')]])
+                return
+            if payload.startswith('manage_'):
+                if message.from_user.id not in config.admins:
+                    raise ValueError('Нет доступа к управлению заказами.')
+                await order_view(message,await store.order(int(payload[7:])),True)
                 return
             if payload.startswith(('view_','chat_')):
                 order=await store.order(int(payload[5:]))
@@ -242,7 +243,7 @@ def make_bot(config: Config, store: Store):
 
     async def callbacks(event: CallbackQuery, state: FSMContext):
         action, *parts = (event.data or '').split(':')
-        admin_actions = {'admin', 'as', 'ae', 'aa', 'af', 'toggle', 'aorders', 'ao', 'settings', 'setting', 'status','delorder','confirmdelete','areply','anunit','ancustom','andesc','ancreate'}
+        admin_actions = {'admin', 'as', 'ae', 'aa', 'af', 'toggle', 'aorders', 'ao', 'settings', 'setting', 'status','delorder','confirmdelete','testnotify','envnotify','areply','anunit','ancustom','andesc','ancreate'}
         if action in admin_actions and event.from_user.id not in config.admins:
             await event.answer('Нет доступа.', show_alert=True)
             return
@@ -425,9 +426,15 @@ def make_bot(config: Config, store: Store):
             await catalog(event, admin=True)
         elif action == 'settings':
             s = await store.settings()
-            await show(event, f'<b>Настройки магазина</b>\n\nКонтакт владельца: @{esc(s["shop_username"])}\nУведомления: {esc(s["notify_chat_id"]) or "администраторам"}\nПриветствие: {esc(s["welcome"])}', [
-                [('Контакт магазина', 'setting:shop_username')], [('Чат уведомлений', 'setting:notify_chat_id')],
+            await show(event, f'<b>Настройки магазина</b>\n\nКонтакт владельца: @{esc(s["shop_username"])}\nУведомления: {esc(s["notify_chat_id"]) or "администраторам"}\nВ .env: {esc(config.notify_chat_id) or "администраторам"}\nПриветствие: {esc(s["welcome"])}', [
+                [('Контакт магазина', 'setting:shop_username')], [('Чат уведомлений', 'setting:notify_chat_id')],[('Проверить уведомления','testnotify')],[('Загрузить чат из .env','envnotify')],
                 [('Приветствие', 'setting:welcome'), ('О магазине', 'setting:about')], [('← Управление', 'admin')]])
+        elif action=='testnotify':
+            result=await deliver_notice(bot,store,config,'✓ Конспектум: проверка уведомлений. Новые заказы и сообщения будут приходить в этот чат.')
+            await event.message.answer(esc(result['message']))
+        elif action=='envnotify':
+            await store.update_settings({'notify_chat_id':config.notify_chat_id})
+            await event.message.answer('✓ Чат уведомлений загружен из .env. Нажмите «Проверить уведомления».')
         elif action == 'setting':
             if parts[0] not in {'shop_username', 'notify_chat_id', 'welcome', 'about'}:
                 raise ValueError('Неизвестная настройка.')
@@ -576,19 +583,18 @@ def make_bot(config: Config, store: Store):
             await state.set_state(Form.customer_message)
             await message.answer(f'✓ Отправлено · {esc(order["code"])}. Можно отправить ещё сообщение или фото.',reply_markup=keyboard([[('К заказу',f'order:{order_id}')]]))
             if fresh:
-                settings=await store.settings()
-                destinations=[settings['notify_chat_id']] if settings['notify_chat_id'] else config.admins
-                async def notify(destination):
-                    try:
-                        await asyncio.wait_for(bot.send_message(destination,f'<b>Сообщение · {esc(order["code"])}</b>\n\n{esc(body) or "Вложение"}',
-                            reply_markup=keyboard([[('Ответить',f'areply:{order_id}')]]) if int(destination)>0 else None),timeout=8)
-                        if attachment:
+                result=await deliver_notice(bot,store,config,f'<b>Сообщение · {esc(order["code"])}</b>\n\n{esc(body) or "Вложение"}',
+                    keyboard([[('Ответить',f'areply:{order_id}')]]),
+                    keyboard([[('Открыть чат заказа',f'https://t.me/{store.config.bot_username}?start=manage_{order_id}')]]) if store.config.bot_username else None)
+                if attachment:
+                    async def notify_attachment(destination):
+                        try:
                             method=bot.send_photo if attachment['kind']=='photo' else bot.send_document
                             field='photo' if attachment['kind']=='photo' else 'document'
                             await asyncio.wait_for(method(destination,**{field:attachment['file_id']},caption=f'Материалы · {esc(order["code"])}'),timeout=15)
-                    except (TelegramAPIError,TimeoutError):
-                        log.warning('Customer message notification unavailable for order %s',order['code'])
-                await asyncio.gather(*(notify(x) for x in destinations))
+                        except (TelegramAPIError,TimeoutError):
+                            log.warning('Attachment notification unavailable for order %s',order['code'])
+                    await asyncio.gather(*(notify_attachment(x) for x in result['delivered_to']))
         except ValueError as exc:
             await message.answer(esc(str(exc)))
 
@@ -631,6 +637,14 @@ def make_bot(config: Config, store: Store):
                 return
         await message.answer('Выберите действие в меню. Материалы и файлы отправьте в чат заказа в этом боте.\n/menu — открыть магазин\n/cancel — отменить ввод')
 
+    group_router=Router()
+
+    @group_router.message(F.chat.type.in_({'group','supergroup'}),Command('chatid','id'))
+    async def group_id(message:Message):
+        if message.from_user and message.from_user.id in config.admins:
+            await message.answer(f'ID этой группы: <code>{message.chat.id}</code>\nУкажите его в настройках чата уведомлений и нажмите «Проверить уведомления».')
+
+    dp.include_router(group_router)
     dp.include_router(router)
     return bot, dp
 
@@ -640,5 +654,5 @@ async def setup_commands(bot: Bot):
     await bot.set_my_description(description='Аккуратные конспекты на машинке по вашим материалам. Выберите услуги и объём, рассчитайте стоимость и обсудите детали в чате заказа в боте. Оплата после согласования.', language_code='ru')
     await bot.set_my_short_description(short_description='Конспекты на заказ. Меньше рутины — больше жизни.', language_code='ru')
     await bot.set_my_commands([BotCommand(command='start', description='Открыть Конспектум'), BotCommand(command='menu', description='Главное меню'),
-                               BotCommand(command='cancel', description='Отменить ввод'), BotCommand(command='id', description='Мой Telegram ID'),
+                               BotCommand(command='cancel', description='Отменить ввод'), BotCommand(command='id', description='Мой Telegram ID'), BotCommand(command='chatid', description='ID группы для уведомлений'),
                                BotCommand(command='admin', description='Управление магазином')])

@@ -127,6 +127,11 @@ class Store:
                                'welcome': 'Ваши мысли — наш аккуратный почерк.',
                                'about': new_about}.items():
                 db.execute('INSERT OR IGNORE INTO settings VALUES (?, ?)', (key, value))
+            previous=db.execute("SELECT value FROM settings WHERE key='env_notify_chat_id'").fetchone()
+            active=db.execute("SELECT value FROM settings WHERE key='notify_chat_id'").fetchone()['value']
+            if (previous and previous['value']!=self.config.notify_chat_id) or (not previous and not active and self.config.notify_chat_id):
+                db.execute("UPDATE settings SET value=? WHERE key='notify_chat_id'",(self.config.notify_chat_id,))
+            db.execute("INSERT INTO settings VALUES('env_notify_chat_id',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(self.config.notify_chat_id,))
             if not db.execute("SELECT 1 FROM settings WHERE key='seeded'").fetchone():
                 for item in [
                     ('Конспект', 'Аккуратно перенесём ваши материалы в тетрадь. Читаемо, ровно, с вниманием к каждой строке.', 'страница', 4500, '✎'),

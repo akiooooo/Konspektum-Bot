@@ -32,6 +32,7 @@ async def main(demo=False,web_only=False,port=None,host=None):
         try:
             me=await asyncio.wait_for(bot.get_me(),timeout=15)
             config=replace(config,bot_username=me.username)
+            store.config=config
         except BaseException:
             await bot.session.close()
             raise

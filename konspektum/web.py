@@ -15,6 +15,7 @@ from aiohttp import web
 from .bot import notify_order
 from .delivery import send_reply,send_status
 from .security import RateLimiter, authenticate
+from .notifications import deliver_notice
 from .store import Conflict, DEADLINES, STATUSES
 
 STATIC = Path(__file__).parent / 'static'
@@ -191,6 +192,18 @@ def create_app(config, store, bot=None):
         await store.update_settings(data)
         return web.json_response({'ok': True})
 
+    async def test_notifications(request):
+        if not bot:
+            raise web.HTTPServiceUnavailable(text='Бот недоступен.')
+        if not limiter.allow(f'notify-test:{request[USER]["id"]}',5):
+            raise web.HTTPTooManyRequests(text='Подождите перед следующей проверкой.')
+        result=await deliver_notice(bot,store,config,'✓ Конспектум: проверка уведомлений. Новые заказы и сообщения будут приходить в этот чат.')
+        return web.json_response(result)
+
+    async def env_notifications(request):
+        await store.update_settings({'notify_chat_id':config.notify_chat_id})
+        return web.json_response({'ok':True})
+
     async def admin_service(request):
         data = await request.json()
         if not isinstance(data, dict):
@@ -302,6 +315,8 @@ def create_app(config, store, bot=None):
     app.router.add_post('/api/auth/start',login_start)
     app.router.add_get('/api/auth/poll',login_poll)
     app.router.add_post('/api/auth/logout',logout)
+    app.router.add_post('/api/admin/notifications/test',test_notifications)
+    app.router.add_post('/api/admin/notifications/from-env',env_notifications)
     app.router.add_delete(r'/api/admin/orders/{id:\d+}',delete_order)
     app.router.add_post(r'/api/admin/orders/{id:\d+}/photo',photo_reply)
     app.router.add_get(r'/api/orders/{id:\d+}/messages/{message:\d+}/attachment',download)
