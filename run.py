@@ -2,11 +2,51 @@
 from pathlib import Path
 import hashlib
 import os
+import re
 import shutil
 import subprocess
 import sys
 import sysconfig
 import venv
+
+
+def pip_environment(direct=False):
+    environment=os.environ.copy()
+    environment.update(PIP_DISABLE_PIP_VERSION_CHECK='1',PYTHONIOENCODING='utf-8')
+    if direct:
+        for key in list(environment):
+            if key.lower() in {'http_proxy','https_proxy','all_proxy','no_proxy','pip_proxy','pip_config_file'}:
+                environment.pop(key)
+        # Applies to this pip process only, including proxies from Windows settings.
+        environment.update(NO_PROXY='*',no_proxy='*',PIP_CONFIG_FILE=os.devnull)
+    return environment
+
+
+def pip_attempt(command, environment):
+    missing_socks=False
+    with subprocess.Popen(command,env=environment,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,
+                          text=True,encoding='utf-8',errors='replace') as process:
+        for line in process.stdout:
+            missing_socks|='missing dependencies for socks support' in line.lower()
+            # Never echo proxy credentials supplied by an installer or proxy error.
+            line=re.sub(r'(?i)((?:https?|socks\w*)://)[^/\s@]+@',r'\1***@',line)
+            print(line,end='',flush=True)
+        return process.wait(),missing_socks
+
+
+def install_dependencies(python, lock, direct=False):
+    command=[str(python),'-m','pip','install','-r',str(lock),'--disable-pip-version-check']
+    try:
+        code,missing_socks=pip_attempt(command,pip_environment(direct))
+        if code and missing_socks and not direct:
+            print('Установщику не хватает поддержки SOCKS. Повторяем установку напрямую по HTTPS. '
+                  'Настройки прокси компьютера и бота не меняются.',flush=True)
+            code,_=pip_attempt(command,pip_environment(True))
+        if code:
+            raise SystemExit('Не удалось установить зависимости. Проверьте сообщение выше и доступ к PyPI. '
+                             'Для прямого подключения только на время установки: python run.py --direct.')
+    except (OSError,subprocess.SubprocessError) as exc:
+        raise SystemExit('Не удалось запустить установщик зависимостей. Проверьте Python и окружение .venv.') from exc
 
 
 def is_msys_python(platform_tag=None, base_prefix=None):
@@ -54,6 +94,9 @@ def validate_environment(python, environment):
 
 
 def main():
+    arguments=sys.argv[1:]
+    direct='--direct' in arguments
+    arguments=[arg for arg in arguments if arg!='--direct']
     if sys.version_info<(3,12):
         raise SystemExit('Нужен Python 3.12 или новее.')
     if is_msys_python():
@@ -70,17 +113,13 @@ def main():
     digest=hashlib.sha256(lock.read_bytes()).hexdigest()
     marker=environment/'.konspektum-dependencies'
     if not marker.exists() or marker.read_text()!=digest:
-        try:
-            subprocess.run([str(python),'-m','pip','install','-r',str(lock),'--disable-pip-version-check'],check=True)
-        except (OSError,subprocess.SubprocessError) as exc:
-            raise SystemExit('Не удалось установить зависимости. Проверьте сообщение установщика выше, доступ к интернету '
-                             'и выбранный Python. Рекомендуется обычный Python 3.13 с python.org.') from exc
+        install_dependencies(python,lock,direct)
         marker.write_text(digest)
-    if not (project/'.env').exists() and not any(x in sys.argv for x in ('--preview','--demo')):
+    if not (project/'.env').exists() and not any(x in arguments for x in ('--preview','--demo','--help','-h')):
         shutil.copyfile(project/'.env.example',project/'.env')
         raise SystemExit('Создан .env. Заполните BOT_TOKEN, ADMIN_IDS и SHOP_USERNAME, затем повторите python run.py.')
     try:
-        return subprocess.call([str(python),'-m','konspektum',*sys.argv[1:]],cwd=project)
+        return subprocess.call([str(python),'-m','konspektum',*arguments],cwd=project)
     except KeyboardInterrupt:
         return 0
 
