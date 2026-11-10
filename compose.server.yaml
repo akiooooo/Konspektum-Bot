@@ -1,0 +1,35 @@
+services:
+  shop:
+    ports: !reset []
+    environment:
+      TRUSTED_PROXY_IPS: 172.30.77.2
+      WEBAPP_URL: https://${SHOP_DOMAIN:?Укажите SHOP_DOMAIN в .env}
+    networks:
+      storefront:
+        ipv4_address: 172.30.77.3
+  gateway:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    environment:
+      SHOP_DOMAIN: ${SHOP_DOMAIN:?Укажите SHOP_DOMAIN в .env}
+    ports:
+      - '80:80'
+      - '443:443'
+      - '443:443/udp'
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      storefront:
+        ipv4_address: 172.30.77.2
+    security_opt:
+      - no-new-privileges:true
+networks:
+  storefront:
+    ipam:
+      config:
+        - subnet: 172.30.77.0/24
+volumes:
+  caddy_data:
+  caddy_config:

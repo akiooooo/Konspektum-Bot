@@ -1,0 +1,4 @@
+{$SHOP_DOMAIN} {
+    encode zstd gzip
+    reverse_proxy shop:8080
+}
