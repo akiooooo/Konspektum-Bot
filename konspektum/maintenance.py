@@ -28,7 +28,7 @@ if __name__=='__main__':
     load_env()
     parser=argparse.ArgumentParser(description='Резервная копия базы Конспектума без остановки магазина')
     parser.add_argument('--db',default=os.getenv('DB_PATH','data/konspektum.sqlite3'))
-    parser.add_argument('--output',default='data/backups/konspektum-'+datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')+'.sqlite3')
+    parser.add_argument('--output',default=str(Path(os.getenv('BACKUP_DIR','data/backups')) / ('konspektum-'+datetime.now(timezone.utc).strftime('%Y%m%d-%H%M%S')+'.sqlite3')))
     args=parser.parse_args()
     try:
         print('Копия создана:',backup(args.db,args.output))

@@ -37,6 +37,7 @@ class Config:
     demo: bool = False
     bot_username: str = ''
     trusted_proxy_ips: frozenset[str] = frozenset()
+    log_chat_id: str = ''
 
     @classmethod
     def from_env(cls, demo: bool = False) -> 'Config':
@@ -59,6 +60,9 @@ class Config:
         if notify_chat and not re.fullmatch(r'-?[1-9]\d{0,19}', notify_chat):
             raise ValueError('NOTIFY_CHAT_ID: числовой ID чата или пустая строка.')
         port = int(os.getenv('PORT', '8080'))
+        log_chat = os.getenv('LOG_CHAT_ID', '').strip()
+        if log_chat and not re.fullmatch(r'-?[1-9]\d{0,19}', log_chat):
+            raise ValueError('LOG_CHAT_ID: числовой ID чата или пустая строка.')
         if not 1 <= port <= 65535:
             raise ValueError('PORT должен быть от 1 до 65535.')
         return cls(token, admins, username(shop or 'konspektum_shop'),
@@ -66,4 +70,4 @@ class Config:
                    os.getenv('HOST', '127.0.0.1'), port,
                    'data/preview.sqlite3' if demo else os.getenv('DB_PATH', 'data/konspektum.sqlite3'), demo,
                    os.getenv('BOT_USERNAME', '').strip().lstrip('@'),
-                   frozenset(x.strip() for x in os.getenv('TRUSTED_PROXY_IPS', '').split(',') if x.strip()))
+                   frozenset(x.strip() for x in os.getenv('TRUSTED_PROXY_IPS', '').split(',') if x.strip()), log_chat)

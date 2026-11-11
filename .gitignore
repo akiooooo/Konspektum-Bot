@@ -3,6 +3,9 @@
 !.env.example
 *.env
 .venv/
+.venv-old/
+.idea/
+dist/
 __pycache__/
 *.py[cod]
 data/

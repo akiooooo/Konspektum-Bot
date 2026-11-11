@@ -13,6 +13,7 @@ from .web import create_app
 from .delivery import status_worker
 from .security import SecretFormatter
 from .polling import ConflictGuard
+from .telegram_logs import TelegramLogs
 
 
 async def main(demo=False,web_only=False,port=None,host=None):
@@ -39,6 +40,11 @@ async def main(demo=False,web_only=False,port=None,host=None):
     runner = web.AppRunner(create_app(config, store, bot), access_log=None)
     await runner.setup()
     worker=None
+    log_handler = TelegramLogs(bot, store, config) if bot and config.log_chat_id else None
+    log_worker = None
+    if log_handler:
+        logging.getLogger().addHandler(log_handler)
+        log_worker = asyncio.create_task(log_handler.run())
     try:
         await web.TCPSite(runner, config.host, config.port).start()
         logging.info('Конспектум: http://%s:%s · магазин запущен', config.host, config.port)
@@ -58,6 +64,12 @@ async def main(demo=False,web_only=False,port=None,host=None):
             if guard.conflict:
                 raise ValueError('Telegram обнаружил другую работающую копию этого бота. Эта копия остановлена, чтобы вход и заказы не попадали в разные базы. Оставьте один запуск бота вместе с его сайтом.')
     finally:
+        if log_handler:
+            logging.getLogger().removeHandler(log_handler)
+            log_worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await log_worker
+            log_handler.close()
         if worker:
             worker.cancel()
             with suppress(asyncio.CancelledError):

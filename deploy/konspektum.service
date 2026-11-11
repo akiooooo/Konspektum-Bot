@@ -1,0 +1,32 @@
+[Unit]
+Description=Konspektum Telegram shop
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=konspektum
+Group=konspektum
+WorkingDirectory=/opt/konspektum
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+Environment=HOST=127.0.0.1
+Environment=PORT=8080
+Environment=DB_PATH=/var/lib/konspektum/konspektum.sqlite3
+Environment=TRUSTED_PROXY_IPS=127.0.0.1
+ExecStart=/opt/konspektum/.venv/bin/python -m konspektum
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=30
+UMask=0077
+StateDirectory=konspektum
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/konspektum
+
+[Install]
+WantedBy=multi-user.target

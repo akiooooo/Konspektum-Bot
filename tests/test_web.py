@@ -32,6 +32,15 @@ class WebTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('nosniff', response.headers['X-Content-Type-Options'])
         self.assertEqual(response.headers['Cache-Control'], 'no-store')
 
+    async def test_chunked_json_cannot_bypass_body_limit(self):
+        async def chunks():
+            yield b'{"note":"'
+            yield b'x' * 40000
+            yield b'"}'
+        response = await self.client.post('/api/orders', data=chunks(),
+            headers=self.user | {'Content-Type': 'application/json'})
+        self.assertEqual(response.status, 413)
+
     async def test_auth_and_admin_permissions(self):
         self.assertEqual((await self.client.get('/api/orders')).status, 401)
         self.assertEqual((await self.client.get('/api/admin/data', headers=self.user)).status, 403)

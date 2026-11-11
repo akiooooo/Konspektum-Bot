@@ -1,0 +1,16 @@
+[Unit]
+Description=Back up Konspektum SQLite database
+
+[Service]
+Type=oneshot
+User=konspektum
+Group=konspektum
+WorkingDirectory=/opt/konspektum
+Environment=DB_PATH=/var/lib/konspektum/konspektum.sqlite3
+Environment=BACKUP_DIR=/var/lib/konspektum/backups
+ExecStart=/opt/konspektum/.venv/bin/python -m konspektum.maintenance
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/konspektum

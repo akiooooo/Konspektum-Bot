@@ -78,7 +78,7 @@ async def notify_order(bot: Bot, store: Store, config: Config, order: dict):
     group=keyboard([[('Открыть заказ в боте',f'https://t.me/{name}?start=manage_{order["id"]}')]]) if name else None
     result=await deliver_notice(bot,store,config,text,private,group)
     if not result['ok']:
-        log.warning('Order notification: %s',result['message'])
+        logging.getLogger('konspektum.orders').warning('Order notification: %s',result['message'])
     return result['delivered']
 
 
@@ -593,7 +593,7 @@ def make_bot(config: Config, store: Store):
                             field='photo' if attachment['kind']=='photo' else 'document'
                             await asyncio.wait_for(method(destination,**{field:attachment['file_id']},caption=f'Материалы · {esc(order["code"])}'),timeout=15)
                         except (TelegramAPIError,TimeoutError):
-                            log.warning('Attachment notification unavailable for order %s',order['code'])
+                            logging.getLogger('konspektum.orders').warning('Attachment notification unavailable for order %s',order['code'])
                     await asyncio.gather(*(notify_attachment(x) for x in result['delivered_to']))
         except ValueError as exc:
             await message.answer(esc(str(exc)))
@@ -650,9 +650,17 @@ def make_bot(config: Config, store: Store):
 
 
 async def setup_commands(bot: Bot):
-    await bot.set_my_name(name='Конспектум', language_code='ru')
-    await bot.set_my_description(description='Аккуратные конспекты на машинке по вашим материалам. Выберите услуги и объём, рассчитайте стоимость и обсудите детали в чате заказа в боте. Оплата после согласования.', language_code='ru')
-    await bot.set_my_short_description(short_description='Конспекты на заказ. Меньше рутины — больше жизни.', language_code='ru')
-    await bot.set_my_commands([BotCommand(command='start', description='Открыть Конспектум'), BotCommand(command='menu', description='Главное меню'),
-                               BotCommand(command='cancel', description='Отменить ввод'), BotCommand(command='id', description='Мой Telegram ID'), BotCommand(command='chatid', description='ID группы для уведомлений'),
-                               BotCommand(command='admin', description='Управление магазином')])
+    # Telegram may rate-limit profile metadata; that must not stop polling.
+    operations = (
+        ('set_my_name', lambda: bot.set_my_name(name='Конспектум', language_code='ru')),
+        ('set_my_description', lambda: bot.set_my_description(description='Готовим аккуратные конспекты на машинке по вашим материалам.\n\nЗдесь можно выбрать услуги, указать объём и срок, узнать предварительную стоимость и оформить заказ. Материалы, детали и оплату обсудим в чате заказа — прямо в этом боте.\n\nНажмите «Начать», чтобы открыть каталог.', language_code='ru')),
+        ('set_my_short_description', lambda: bot.set_my_short_description(short_description='Конспекты на заказ по вашим материалам. Каталог, расчёт стоимости и связь с магазином — в одном боте.')),
+        ('set_my_commands', lambda: bot.set_my_commands([BotCommand(command='start', description='Открыть Конспектум'), BotCommand(command='menu', description='Главное меню'),
+                                                            BotCommand(command='cancel', description='Отменить ввод'), BotCommand(command='id', description='Мой Telegram ID'), BotCommand(command='chatid', description='ID группы для уведомлений'),
+                                                            BotCommand(command='admin', description='Управление магазином')])),
+    )
+    for operation, request in operations:
+        try:
+            await request()
+        except TelegramAPIError as exc:
+            log.warning('Telegram setup %s skipped: %s', operation, exc)

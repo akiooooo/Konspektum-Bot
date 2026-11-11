@@ -73,5 +73,5 @@ async def status_worker(bot,store):
             for event_id in await store.pending_statuses():
                 await send_status(bot,store,event_id)
         except Exception:
-            logging.getLogger(__name__).error('Status notification queue is temporarily unavailable; retrying.')
+            logging.getLogger('konspektum.orders').error('Status notification queue is temporarily unavailable; retrying.')
         await asyncio.sleep(10)

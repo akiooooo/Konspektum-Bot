@@ -72,6 +72,8 @@ def create_app(config, store, bot=None):
                     raise web.HTTPTooManyRequests(text='Слишком много запросов.')
                 if request.method not in {'GET','HEAD'}:
                     photo_upload=bool(re.fullmatch(r'/api/admin/orders/\d+/photo',request.path))
+                    # Enforce read() limits even for chunked bodies without Content-Length.
+                    request._client_max_size = 9*1024*1024 if photo_upload else 32768
                     expected_type='multipart/form-data' if photo_upload else 'application/json'
                     if not origin_ok(request) or request.content_type!=expected_type:
                         raise web.HTTPForbidden(text='Запрос отклонён. Обновите страницу магазина.')
@@ -102,7 +104,9 @@ def create_app(config, store, bot=None):
         except web.HTTPException as exc:
             response = web.json_response({'error': exc.text}, status=exc.status)
         except Exception:
-            log.exception('Request failed: %s', request.path)
+            # Paths may contain attacker-controlled secrets; log the route template only.
+            log.exception('Request failed: %s', request.match_info.route.resource.canonical
+                          if request.match_info.route.resource else '<unmatched>')
             response = web.json_response({'error': 'Не удалось выполнить запрос. Попробуйте ещё раз.'}, status=500)
         response.headers.update({
             'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
